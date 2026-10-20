@@ -1,0 +1,13 @@
+# ---------- 音频采集与处理 ----------
+sounddevice>=0.4.6
+numpy>=1.21
+
+# ---------- 本地语音（ASR / VAD / KWS / TTS） ----------
+sherpa-onnx>=1.9.0
+
+# ---------- 在线 API 调用 ----------
+requests>=2.28
+
+# ---------- ai_chat_cli.py 依赖 ----------
+openai>=1.0.0
+#gradio_client>=1.0.0       #安装需要python3.10 以上版本， 默认走HTTP SSE方式下载

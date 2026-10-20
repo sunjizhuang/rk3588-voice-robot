@@ -1,0 +1,21 @@
+[Unit]
+Description=RK3588 Voice Robot
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+WorkingDirectory=/opt/robot
+EnvironmentFile=/opt/robot/robot.env
+ExecStart=/opt/robot/venv/bin/python /opt/robot/main.py --http --port 8765
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot
+
+[Install]
+WantedBy=multi-user.target
+

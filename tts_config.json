@@ -1,0 +1,84 @@
+{
+  "enabled": true,
+  "server": "http://192.168.199.7:8808",
+  "api_name": "/generate",
+  "backend": "auto",
+  "out_dir": "./outputs",
+  "auto_play": false,
+  "gapless": true,
+  "stream_workers": 4,
+  "seed": 42,
+
+  "split": {
+    "comma_threshold": 32,
+    "min_chars": 6
+  },
+
+  "active_profile": "male_lib",
+
+  "profiles": {
+    "default": {
+      "mode": "design",
+      "control_instruction": "温暖自然的女声，语速适中",
+      "reference_wav": null,
+      "transcript": "",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    },
+    "robot": {
+      "mode": "clone",
+      "control_instruction": "",
+      "reference_wav": "./voices/robot.wav",
+      "transcript": "",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    },
+    "narrator": {
+      "mode": "ultimate",
+      "control_instruction": "",
+      "reference_wav": "./voices/narrator.wav",
+      "transcript": "支持微信授权登录，服务器端连接，服务端连接局域网",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    },
+    "female_lib": {
+      "mode": "library",
+      "voice_id": "female",
+      "control_instruction": "语速适中，每分钟约180字，句间停顿自然；中音区，音调平稳，无明显高低起伏；情绪平静中性，无强烈情绪；陈述语气，不带疑问感叹命令；重音落在关键词，不随意强调；节奏均匀，不拖长音，不急促。",
+      "reference_wav": null,
+      "transcript": "",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    },
+    "male_lib": {
+      "mode": "library",
+      "voice_id": "male",
+      "control_instruction": "语速适中，每分钟约180字，句间停顿自然；中音区，音调平稳，无明显高低起伏；情绪平静中性，无强烈情绪；陈述语气，不带疑问感叹命令；重音落在关键词，不随意强调；节奏均匀，不拖长音，不急促。",
+      "reference_wav": null,
+      "transcript": "",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    },    
+    "eric_lib": {
+      "mode": "library",
+      "voice_id": "eric",
+      "control_instruction": "",
+      "reference_wav": null,
+      "transcript": "",
+      "cfg_value": 2.0,
+      "dit_steps": 10,
+      "do_normalize": false,
+      "denoise": false
+    }
+  }
+}

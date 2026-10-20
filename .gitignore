@@ -1,0 +1,14 @@
+# Python 虚拟环境
+venv/
+
+# 模型文件
+models/
+
+# 输出结果
+outputs/
+
+# Python 缓存
+__pycache__/
+
+# 环境配置文件（含敏感信息）
+robot.env
