@@ -377,18 +377,22 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
 
         else:
             log.info("[Route] 走 DeepSeek（TTS 模式：%s）", router.chat_tts_mode)
-            answer, error, tts_action = router.chat(text)
-            if error:
-                log.error("[ChatCLI] 错误：%s", error)
-                speak_async(player, tts, "查询失败，请稍后再试")
-            else:
-                log.info("[回复] \033[36m%s\033[0m", answer)
-                if tts_action == "need_sherpa":
-                    speak_streaming_async(player, tts, answer)
+
+            def _chat_async():
+                answer, error, tts_action = router.chat(text)
+                if error:
+                    log.error("[ChatCLI] 错误：%s", error)
+                    speak_async(player, tts, "查询失败，请稍后再试")
                 else:
-                    tts_speaking.set()
-                    time.sleep(0.3)
-                    tts_speaking.clear()
+                    log.info("[回复] %s", answer)
+                    if tts_action == "need_sherpa":
+                        speak_streaming_async(player, tts, answer)
+                    else:
+                        tts_speaking.set()
+                        time.sleep(0.3)
+                        tts_speaking.clear()
+
+            threading.Thread(target=_chat_async, daemon=True).start()
 
     if text_input:
         try:
