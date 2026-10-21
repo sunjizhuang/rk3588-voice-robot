@@ -375,7 +375,7 @@ class HttpSseBackend:
 
 def _parse_audio_info(audio_info: Any) -> Tuple[Optional[int], Optional[str]]:
     """把 server 返回的 audio 字段解析成 (sample_rate, file_path)。"""
-    print(f"[debug] audio_info = {audio_info!r}")
+    #print(f"[debug] audio_info = {audio_info!r}")
 
     if audio_info is None:
         return None, None

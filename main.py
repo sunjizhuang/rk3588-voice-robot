@@ -188,7 +188,6 @@ def _voxcpm_player_loop(player: AudioPlayer, stop_event: threading.Event):
         if path is None:
             break
 
-        # 批量取：把队列里已就绪的段一起取
         batch = [path]
         while True:
             try:
@@ -219,8 +218,6 @@ def _voxcpm_player_loop(player: AudioPlayer, stop_event: threading.Event):
                 else:
                     for p in batch:
                         player.play_wav_file(p, wait=True)
-                        
-            log.info("[VoxCPM] 播报完成")            
         except Exception as e:
             log.error("[VoxCPM] 播放失败：%s", e)
         finally:
@@ -274,6 +271,58 @@ def _watch_voxcpm_outputs(out_dir: str, stop_event: threading.Event):
         time.sleep(0.1)
 
 
+def _setup_voxcpm_watcher(player: AudioPlayer):
+    """
+    读 tts_config.json → 准备 out_dir（确保存在、清空旧 wav）
+    → 启动监控线程 + 播放线程。
+    返回 (out_dir_abs, stop_event)。
+    """
+    from config import BASE_DIR
+
+    tts_cfg_path = str(BASE_DIR / "tts_config.json")
+    out_dir = "outputs"
+    try:
+        if os.path.isfile(tts_cfg_path):
+            with open(tts_cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            out_dir = cfg.get("out_dir") or "outputs"
+    except Exception:
+        pass
+
+    out_dir_abs = os.path.abspath(os.path.expanduser(out_dir))
+    os.makedirs(out_dir_abs, exist_ok=True)
+
+    # 清空旧 wav
+    try:
+        cleared = 0
+        for name in os.listdir(out_dir_abs):
+            if name.lower().endswith('.wav'):
+                try:
+                    os.unlink(os.path.join(out_dir_abs, name))
+                    cleared += 1
+                except OSError as e:
+                    log.warning("[VoxCPM-Watch] 删除 %s 失败：%s", name, e)
+        log.info("[VoxCPM-Watch] 已清空旧 wav：%s（删除 %d 个）", out_dir_abs, cleared)
+    except Exception as e:
+        log.warning("[VoxCPM-Watch] 清空旧 wav 失败：%s", e)
+
+    stop_event = threading.Event()
+
+    threading.Thread(
+        target=_watch_voxcpm_outputs,
+        args=(out_dir_abs, stop_event),
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=_voxcpm_player_loop,
+        args=(player, stop_event),
+        daemon=True,
+    ).start()
+
+    return out_dir_abs, stop_event
+
+
 def check_models(use_kws: bool):
     files = [VAD_MODEL, ASR_ENCODER, ASR_DECODER, ASR_TOKENS,
              f"{TTS_MODEL_DIR}/model.onnx", f"{TTS_MODEL_DIR}/tokens.txt"]
@@ -300,32 +349,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
 
     player = AudioPlayer(samplerate=48000, channels=1, device=None)
 
-    from config import BASE_DIR
-    tts_cfg_path = str(BASE_DIR / "tts_config.json")
-    out_dir = "outputs"
-    try:
-        if os.path.isfile(tts_cfg_path):
-            with open(tts_cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            out_dir = cfg.get("out_dir") or "outputs"
-    except Exception:
-        pass
-    out_dir_abs = os.path.abspath(os.path.expanduser(out_dir))
-    os.makedirs(out_dir_abs, exist_ok=True)
-
-    stop_event = threading.Event()
-
-    threading.Thread(
-        target=_watch_voxcpm_outputs,
-        args=(out_dir_abs, stop_event),
-        daemon=True,
-    ).start()
-
-    threading.Thread(
-        target=_voxcpm_player_loop,
-        args=(player, stop_event),
-        daemon=True,
-    ).start()
+    out_dir_abs, stop_event = _setup_voxcpm_watcher(player)
 
     log.info("初始化 VAD...")
     vad = SileroVAD(VAD_MODEL)
@@ -384,7 +408,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                     log.error("[ChatCLI] 错误：%s", error)
                     speak_async(player, tts, "查询失败，请稍后再试")
                 else:
-                    log.info("[回复] %s", answer)
+                    log.info("[回复] \033[36m%s\033[0m", answer)
                     if tts_action == "need_sherpa":
                         speak_streaming_async(player, tts, answer)
                     else:
@@ -412,7 +436,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                     samples, sr = tts.synthesize("查询失败，请稍后再试")
                     player.play(samples, sr, wait=True)
                 else:
-                    log.info("回复：%s", answer)
+                    log.info("回复：\033[36m%s\033[0m", answer)
                     if tts_action == "need_sherpa":
                         samples, sr = tts.synthesize(answer)
                         player.play(samples, sr, wait=True)
@@ -494,8 +518,8 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                             t_send_asr = time.time()
                             log.info("[TIMING] 送 ASR：音频=%.2fs, t=%.3f", duration, t_send_asr)
 
-                            #import soundfile as sf
-                            #sf.write(f"/tmp/vad_seg_{int(time.time())}.wav", audio, 16000)
+                            import soundfile as sf
+                            sf.write(f"/tmp/vad_seg_{int(time.time())}.wav", audio, 16000)
 
                             text = asr.decode(asr_stream, audio).strip()
 
@@ -546,7 +570,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                         text = asr.decode_stream(asr_stream, chunk_16k)
 
                         if text and text != _last_stream_text:
-                            sys.stdout.write(f"\r[ASR] {text}")
+                            sys.stdout.write(f"\r[ASR] \033[32m{text}\033[0m")
                             sys.stdout.flush()
                             _last_stream_text = text
 
@@ -554,7 +578,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                             if _last_stream_text:
                                 sys.stdout.write("\n")
                                 sys.stdout.flush()
-                                log.info("[ASR] %s", _last_stream_text)
+                                log.info("[ASR] \033[32m%s\033[0m", _last_stream_text)
                                 handle_asr_text(_last_stream_text)
 
                             asr_stream = asr.create_stream()
