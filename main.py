@@ -276,7 +276,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
 
     kws, kws_stream = None, None
     if use_kws:
-        log.info("初始化 KWS（唤醒词：灵境灵境）...")
+        log.info("初始化 KWS（唤醒词：小白小白）...")
         kws = KWSEngine()
         kws_stream = kws.create_stream()
 
@@ -349,7 +349,7 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
     # ---------------- 语音主循环 ----------------
     print()
     log.info("===== 机器人已启动 =====")
-    if use_kws: log.info("请先说「灵境灵境」唤醒")
+    if use_kws: log.info("请先说「小白小白」唤醒")
     else: log.info("无需唤醒，直接说话")
     log.info("ASR 显示模式：%s", asr_display_mode)
     log.info("ASR-Only：%s", "是" if asr_only else "否")
@@ -397,6 +397,14 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                     vad.feed(chunk_16k)
                     if vad.has_speech():
                         t_vad_trigger = time.time()
+
+                        # ★ 强行多读 200ms（2个 chunk）的音频，防止丢尾音
+                        import numpy as np
+                        tail_audio = np.zeros(0, dtype=np.float32)
+                        for _ in range(2): 
+                            tail_audio = np.concatenate([tail_audio, read_chunk(mic)])
+                        vad.feed(tail_audio) # 把这200ms塞给 VAD
+
                         vad.flush()
                         while vad.has_speech():
                             audio, start_sec, duration = vad.pop_speech()
@@ -409,8 +417,8 @@ def main(start_http=False, http_port=TEXT_INPUT_PORT,
                             t_send_asr = time.time()
                             log.info("[TIMING] 送 ASR：音频=%.2fs, t=%.3f", duration, t_send_asr)
 
-                            import soundfile as sf
-                            sf.write(f"/tmp/vad_seg_{int(time.time())}.wav", audio, 16000)
+                            #import soundfile as sf
+                            #sf.write(f"/tmp/vad_seg_{int(time.time())}.wav", audio, 16000)
 
                             text = asr.decode(asr_stream, audio).strip()
 

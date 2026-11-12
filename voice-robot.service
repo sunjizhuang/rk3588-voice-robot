@@ -1,0 +1,25 @@
+[Unit]
+Description=RK3588 Voice Robot
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 板上默认用 root；改用普通用户时：
+#   1) 改下面的 User=/Group=
+#   2) sudo usermod -aG audio,video <用户名>
+#   3) sudo chown -R <用户名>:<用户名> /opt/rk3588-voice-robot
+#   4) 用该用户重建 venv（否则 ExecStart 找不到解释器）
+User=root
+Group=root
+WorkingDirectory=/opt/rk3588-voice-robot
+EnvironmentFile=/opt/rk3588-voice-robot/robot.env
+ExecStart=/opt/rk3588-voice-robot/venv/bin/python /opt/rk3588-voice-robot/main.py --http --port 8765
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-robot
+
+[Install]
+WantedBy=multi-user.target

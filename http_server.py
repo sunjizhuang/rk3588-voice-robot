@@ -13,7 +13,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>灵境小助手</title>
+<title>Nexus 语音连接</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { 
@@ -111,7 +111,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 
 <header>
-  灵境小助手
+  Nexus 语音连接
   <div id="conn-status">
     <div class="dot-conn" id="conn-dot"></div>
     <span id="conn-text">未连接</span>

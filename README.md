@@ -14,7 +14,7 @@
 6. [配置文件详解](#6-配置文件详解)
 7. [快速开始](#7-快速开始)
 8. [主循环工作流程](#8-主循环工作流程)
-9. [WAV 播放器子进程](#9-wav-播放器子进程)
+9. [VoxCPM 输出监控与播放](#9-voxcpm-输出监控与播放主进程内线程)
 10. [TTS 引擎与降级策略](#10-tts-引擎与降级策略)
 11. [动作分流与 MQTT](#11-动作分流与-mqtt)
 12. [HTTP 文本输入接口](#12-http-文本输入接口)
@@ -37,7 +37,7 @@
 | 🔊 本地 TTS | sherpa-onnx VITS | 固定话术、降级播报 |
 | 🎙️ 云端 TTS | VoxCPM2（Gradio server） | DeepSeek 结果的语音合成 |
 | 🤖 动作控制 | MQTT | 通过 `send_mqtt.sh` 下发 |
-| 📂 WAV 播放器 | 常驻 aplay + 目录监控 | 播放 VoxCPM 输出的 wav |
+| 📂 VoxCPM 播放 | 主进程内监控线程 + AudioPlayer | 监控 outputs/ 目录，线程内直接播放 wav |
 
 ---
 
@@ -47,7 +47,7 @@
 - **双 TTS 引擎**：固定话术走本地 sherpa，复杂回答走云端 VoxCPM；VoxCPM 失败时自动降级到 sherpa。
 - **动作优先分流**：ASR 文本先做最长包含匹配，命中动作词直接下发 MQTT，未命中才走 LLM。
 - **播报期间暂停拾音**：`tts_speaking` 标志置位时，主循环跳过 VAD/KWS，避免"自问自答"。
-- **WAV 播放器子进程托管**：随主程序启动、随主程序退出；配置禁用时可一键关闭。
+- **VoxCPM 播放线程化**：主进程内监控 + 播放两个守护线程，随主程序启动、随 `stop_event` 退出；多段输出可用 ffmpeg 合并后无缝播放。
 - **HTTP 文本输入接口**：带 API Key 校验，支持外部系统远程播报。
 - **开机自启**：通过 systemd 管理，断电恢复后自动运行。
 
@@ -85,32 +85,31 @@
 │       │              └──────┬─────┘ └─────┬────┘  └─────────┘ │
 │       │                     │             │                  │
 │       │                     ▼             ▼                  │
-│       │                 ┌───────┐   ┌──────────┐             │
-│       │                 │ 扬声器 │   │ outputs/ │             │
-│       │                 └───────┘   │  *.wav   │             │
-│       │                             └─────┬────┘             │
-│       │                                   │                  │
-│  ┌────┴───────────────────────────────────┼────────────────┐ │
-│  │         tts_speaking（全局 Event）      │                │ │
-│  └────────────────────────────────────────┼────────────────┘ │
-│                                           ▼                  │
-│                              ┌────────────────────────┐      │
-│                              │ wav_player.py（子进程） │      │
-│                              │  监控目录 + 常驻 aplay  │      │
-│                              └────────────┬───────────┘      │
-│                                           │                  │
-│                                           ▼                  │
-│                                       ┌───────┐              │
-│                                       │ 扬声器 │              │
-│                                       └───────┘              │
+│       │                 ┌───────┐   ┌──────────────┐         │
+│       │                 │ 扬声器 │   │ outputs/     │         │
+│       │                 └───────┘   │  *.wav       │         │
+│       │                             └─────┬────────┘         │
+│       │                                   │ 监控线程发现新 wav │
+│       │                                   ▼                  │
+│       │                     ┌──────────────────────┐         │
+│       │                     │ 播放线程（主进程内）    │         │
+│       │                     │ AudioPlayer 批量播放   │         │
+│       │                     └──────────┬───────────┘         │
+│       │                                ▼                     │
+│       │                            ┌───────┐                 │
+│       │                            │ 扬声器 │                 │
+│       │                            └───────┘                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **关键点：**
 
-- **两个播放源**：本地 sherpa（`speak_async`）和 wav_player（播放 VoxCPM 输出）。
+- **两个播放源**：本地 sherpa（`speak_async`）和 VoxCPM 监控线程（`_voxcpm_player_loop`），
+  都在主进程内，共用 `AudioPlayer`。
 - **`tts_speaking` 由 sherpa 分支维护**；VoxCPM 分支只做短占位（0.3s），后续靠 VAD 门限过滤回灌。
-- **wav_player 是子进程**，主进程不感知它的播放状态（选定策略 ④）。
+- **VoxCPM 播放是主进程内的守护线程**：`_watch_voxcpm_outputs` 每 0.1s 扫描 outputs/，
+  新 wav 投入 `voxcpm_play_queue`；播放线程批量取出，多段时用 ffmpeg concat 合并后一次播放。
+- 退出方式：主流程 `finally: stop_event.set()` 结束两个守护线程，无子进程需要回收。
 
 ---
 
@@ -138,19 +137,28 @@
 ├── ai_voxcpm_cli.py           # VoxCPM 客户端 + 动态 TTS 组件
 ├── tts_config.json            # TTS 配置（多 profile）
 │
-├── http_server.py             # HTTP 文本输入接口
-├── wav_player.py              # WAV 目录监控播放器（子进程）
+├── http_server.py             # HTTP 服务（Web 对话 UI + SSE + 文本指令）
 │
 ├── models/                    # 模型文件
 │   ├── silero_vad.onnx
 │   ├── sherpa-onnx-streaming-paraformer-bilingual-zh-en/
-│   ├── sherpa-onnx-vits-zh-ll/
+│   ├── vits-melo-tts-zh_en/
 │   └── sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/
 │
 ├── voices/                    # 客户端参考音频（clone / ultimate 用）
 ├── outputs/                   # VoxCPM 输出目录（每次启动清空）
+├── voice-robot.service        # systemd 服务单元（开机自启）
+│
+├── scripts/
+│   ├── deploy.sh              # 一键部署（幂等，支持 --service / --skip-apt）
+│   ├── download_models.sh     # 模型下载（断点续传 + 镜像回退）
+│   └── install.sh             # venv + pip 简版安装
+│
 └── README.md                  # 本文档
 ```
+
+> 历史文件 `wav_player_orig.py` 是早期「子进程 + 常驻 aplay」播放方案的存档，
+> 当前主流程已不使用，仅在需要单独回放 wav 时可参考。
 
 ---
 
@@ -164,7 +172,28 @@
 - 可访问互联网（LLM API、VoxCPM server）
 - 可访问 MQTT 服务器
 
-### 5.2 创建虚拟环境
+### 5.2 一键部署（推荐）
+
+把 5.4–5.6 的系统依赖、venv、pip、模型下载、`robot.env` 生成和依赖自检串成一条命令，**幂等**，可重复执行：
+
+```bash
+bash scripts/deploy.sh              # 基础部署：apt + venv + pip + 模型 + env 文件 + 自检
+bash scripts/deploy.sh --service    # 基础部署后，再安装/更新 systemd 服务并启动
+bash scripts/deploy.sh --skip-apt   # 跳过 apt（离线或系统依赖已装好时）
+bash scripts/deploy.sh --help       # 查看用法
+```
+
+脚本行为说明：
+
+- 已完成的步骤自动跳过（如 `venv/` 存在则复用，`robot.env` 存在则不覆盖）
+- 先试清华源装依赖，失败自动回退官方源重试一次
+- 逐项打印 `send_mqtt.sh` 的 `MQTT_HOST`、`tts_config.json` 的 `server`、`config.py` 的 `TRANSLATE_URL`，**只提醒不修改**
+- 结尾汇总待处理事项（未填的 API Key、缺失的命令、需人工确认的地址等）
+- 不做的事：不修改你已有的配置值，不改 `main.py` / `config.py` / `tts_config.json`
+
+> 手动分步安装仍然有效，见 5.4–5.6。想精确控制每一步时按下面流程操作。
+
+### 5.3 创建虚拟环境
 
 ```bash
 cd /opt/rk3588-voice-robot
@@ -186,7 +215,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python -c "import sherpa_onnx, sounddevice, numpy; print('ok')"
 ```
 
-### 5.3 下载模型
+### 5.4 下载模型
 
 ```bash
 bash scripts/download_models.sh
@@ -194,7 +223,7 @@ bash scripts/download_models.sh
 
 或将模型手动放置到 `models/` 对应目录。
 
-### 5.4 测试麦克风与扬声器
+### 5.5 测试麦克风与扬声器
 
 ```bash
 # 录音 3 秒
@@ -228,7 +257,7 @@ EOF
 
 能听到声音的索引填到 `config.py` 的 `AUDIO_OUTPUT_DEVICE`。
 
-### 5.5 环境变量
+### 5.6 环境变量
 
 复制 `robot.env.example` 为 `robot.env`：
 
@@ -285,7 +314,6 @@ ZHIPUAI_API_KEY=xxxxxxxxxxxxxxxx
   "api_name": "/generate",
   "backend": "auto",
   "out_dir": "/opt/rk3588-voice-robot/outputs",
-  "wav_player_enabled": true,
   "auto_play": true,
   "gapless": true,
   "stream_workers": 4,
@@ -364,7 +392,6 @@ ZHIPUAI_API_KEY=xxxxxxxxxxxxxxxx
 | `api_name` | str | `/generate` | 接口名 |
 | `backend` | str | auto | auto / gradio / http |
 | `out_dir` | str | `./outputs` | VoxCPM 输出目录；建议绝对路径 |
-| **`wav_player_enabled`** | bool | true | **是否随主程序启动 wav_player 子进程** |
 | `auto_play` | bool | true | 是否自动播放 |
 | `gapless` | bool | true | 段间拼接 |
 | `stream_workers` | int | 4 | 并发生成线程数 |
@@ -417,17 +444,15 @@ python main.py --text "今天北京天气怎么样"
 
 跳过麦克风和 ASR，直接走文本分流。
 
-### 7.4 禁用 WAV 播放器
+### 7.4 只落盘、不自动播放 VoxCPM 输出
 
-修改 `tts_config.json`：
+VoxCPM 输出由主进程内的监控线程发现并自动播放。若只想落盘、用另一台设备拉取
+音频（或调试时不想被扬声器打断），把 `tts_config.json` 的 `server` 指向一个
+不存在的地址即可让生成降级/失败，或直接在板端不接扬声器；监控线程播放失败只
+会记日志，不影响主流程。
 
-```json
-{
-  "wav_player_enabled": false
-}
-```
-
-或直接删除这一行——`tts_config.json` 里没有该字段时视为 `true`。
+> 历史版本支持 `tts_config.json` 里 `"wav_player_enabled": false` 一键关闭子进程
+> 播放器；当前线程化实现中该字段**已不再读取**，保留在旧配置文件里不会有副作用。
 
 ### 7.5 HTTP 调用
 
@@ -449,10 +474,12 @@ main()
   │
   ├─ check_models()            检查所有模型文件
   │
-  ├─ _setup_wav_player()       ★ 启动 WAV 播放器子进程
-  │    ├─ 读 tts_config.json
+  ├─ _setup_voxcpm_watcher()   ★ 启动 VoxCPM 输出监控 + 播放线程
+  │    ├─ 读 tts_config.json 的 out_dir
   │    ├─ 清空 out_dir（保留目录本身）
-  │    └─ subprocess.Popen(wav_player.py, out_dir_abs)
+  │    └─ 启动两个守护线程：
+  │         _watch_voxcpm_outputs  每 0.1s 扫描新 wav → 投入队列
+  │         _voxcpm_player_loop    从队列取 wav，批量合并播放
   │
   ├─ 初始化 VAD
   ├─ 初始化 ASR
@@ -461,7 +488,7 @@ main()
   ├─ 初始化 KWS（可选）
   ├─ 启动 HTTP 服务器（可选）
   │
-  ├─ [纯文本模式] 执行单次查询 → finally: stop_wav_player()
+  ├─ [纯文本模式] 执行单次查询 → finally: stop_event.set()
   │
   └─ [语音模式] 进入主循环
        │
@@ -470,7 +497,7 @@ main()
        ├─ if 未唤醒: KWS 检测 → 唤醒后说"我在"
        ├─ else: VAD 检测语音段 → ASR 识别 → 分流
        │
-       └─ Ctrl+C → finally: stop_wav_player()
+       └─ Ctrl+C → finally: stop_event.set()
 ```
 
 ### 8.2 分流规则
@@ -488,86 +515,75 @@ ASR 出文本后：
 |----------|---------|--------|
 | 本地 sherpa TTS | `speak_async()` | `tts_speaking` Event |
 | VoxCPM（ai_chat_cli 内部播放） | 短占位 0.3s | 同上 |
-| wav_player 播放 wav | **不维护** | 无（靠 VAD 门限过滤） |
+| VoxCPM 监控线程播放 wav | 短占位 0.3s | 同上（线程发布 `tts_done`，主循环靠 VAD 门限过滤回灌） |
 
-**为什么 wav_player 不维护 `tts_speaking`：** wav_player 是子进程，与主进程不共享内存。若要感知，需引入心跳文件或信号机制——选定策略 ④ 是不感知，靠 VAD 阈值过滤回灌。
+**说明：** VoxCPM 监控/播放线程虽然在主进程内，但与 `tts_speaking` 的维护是解耦的：
+线程只发布 `status_speak` / `tts_done` 事件，播放期间依旧靠 VAD 阈值过滤喇叭回灌，
+与 sherpa 分支的强屏蔽（`tts_speaking` 置位期间跳过 VAD/KWS）是两种强度。
 
 ---
 
-## 9. WAV 播放器子进程
+## 9. VoxCPM 输出监控与播放（主进程内线程）
 
 ### 9.1 定位
 
-`wav_player.py` 是一个**独立脚本**，职责单一：
+VoxCPM（Gradio server）生成的 wav 落在 `outputs/` 目录，主进程通过**两个守护线程**
+完成发现与播放，不再使用独立的子进程播放器：
 
-- 监控指定目录
-- 检测新出现的、写完的 wav 文件
-- 按文件名时间戳排序，依次播放
-- 常驻一个 aplay 进程，避免反复 fork/exec
+- `_watch_voxcpm_outputs(out_dir, stop_event)`：目录监控线程
+- `_voxcpm_player_loop(player, stop_event)`：播放线程
 
-**它本身不感知主进程**，可以被单独运行：
+### 9.2 工作流程
 
-```bash
-python3 wav_player.py /opt/rk3588-voice-robot/outputs
-```
-
-### 9.2 主进程如何托管
-
-`main.py` 里的 `_setup_wav_player()`：
+**监控线程**（`main.py: _watch_voxcpm_outputs`）：
 
 | 步骤 | 动作 |
 |------|------|
-| 1 | 读 `tts_config.json` 的 `out_dir` 与 `wav_player_enabled` |
-| 2 | 若禁用，返回 no-op stop 函数 |
-| 3 | 清空 `out_dir`（保留目录本身） |
-| 4 | `subprocess.Popen([python, wav_player.py, out_dir_abs])` |
-| 5 | 返回幂等 stop 闭包 |
+| 1 | 启动时做基线扫描：目录里已有的 wav 全部标记为「已播放」，避免重播旧文件 |
+| 2 | 每 0.1s 扫描一次目录，找出新增的 `.wav` |
+| 3 | 校验文件有效（大小 > 0 且 `wave.open` 可读，即写完的合法 wav） |
+| 4 | 按文件名排序后投入 `voxcpm_play_queue` |
 
-**退出时**：`stop_wav_player()` 调用 `proc.terminate()`（SIGTERM），wav_player 内部的 signal handler 走 `watcher.stop()` → 关闭 aplay → 退出。3 秒超时则 SIGKILL。
+**播放线程**（`main.py: _voxcpm_player_loop`）：
 
-### 9.3 为什么先清空后启动
+| 步骤 | 动作 |
+|------|------|
+| 1 | 从队列取一个路径，并把队列中已就绪的路径**批量取出** |
+| 2 | 单段：直接 `player.play_wav_file(path, wait=True)` |
+| 3 | 多段：先尝试 `ffmpeg concat` 合并成一个 wav 播放（`-c copy`，无重编码） |
+| 4 | ffmpeg 不可用或合并失败：逐段顺序播放 |
+| 5 | 发布 `status_speak` / `tts_done` 事件，供 Web UI 显示状态 |
 
-`wav_player.py` 启动时会做**基线扫描**：把目录里已存在的 wav 全部标记为「已播放」，避免重播旧文件。
+### 9.3 启动与退出
 
-如果先启动后清空：
+`_setup_voxcpm_watcher(player)`（`main.py:212`）：
 
-- 旧 wav 被标记为已播 → 无副作用但语义混乱
-- 清空发生在播放线程可能已取走文件之后 → 竞态
+| 步骤 | 动作 |
+|------|------|
+| 1 | 读 `tts_config.json` 的 `out_dir`（缺省 `outputs`） |
+| 2 | 清空 `out_dir` 里的旧 wav（保留目录本身） |
+| 3 | 启动上述两个守护线程 |
+| 4 | 返回 `(out_dir_abs, stop_event)` |
 
-先清空后启动：启动时目录为空，基线扫描无事可做，语义最清晰。
+**退出时**：主流程 `finally: stop_event.set()`，两个线程在 0.5s 内自然退出
+（线程均为 daemon，进程退出时也会被强制回收）。
 
-### 9.4 为什么用子进程而不是线程
+### 9.4 为什么先清空后启动
 
-| 维度 | 子进程（选定方案） | 线程 |
-|------|-------------------|------|
-| wav_player 改动 | **0 行** | 需加 `stop_event` / 回调 |
-| 崩溃隔离 | aplay 崩溃不影响主进程 | 会拖垮主进程 |
-| 职责边界 | 完全独立 | 需处理共享状态 |
-| 与主进程通信 | 通过文件（隐式） | 可直接共享 `tts_speaking` |
+监控线程启动时会做基线扫描：把目录里已存在的 wav 全部标记为「已播放」，
+避免重播旧文件。先清空后启动，基线扫描无事可做，语义最清晰。
 
-选定方案以「**不改变 wav_player 本身职责**」为硬约束，子进程最符合。
+### 9.5 为什么用线程而不是子进程（相对早期方案的变更）
 
-### 9.5 禁用方式
+| 维度 | 线程（当前方案） | 子进程（早期 wav_player 方案） |
+|------|-----------------|------------------------------|
+| 播放共享 | 直接复用主进程 `AudioPlayer`，与 sherpa TTS 用同一套输出设备管理 | 需独立管理 aplay 设备，易与主进程抢占 |
+| 段间衔接 | 可在播放前用 ffmpeg 合并，实现近似无缝拼接 | 只能顺序播放，段间有 aplay 启停间隙 |
+| 状态同步 | 同进程，可读 `tts_speaking`、发布 event_bus 事件 | 需文件/信号等跨进程机制 |
+| 生命周期 | daemon 线程，`stop_event.set()` 即停 | 需 SIGTERM/SIGKILL 托管与超时兜底 |
 
-`tts_config.json`：
-
-```json
-{
-  "wav_player_enabled": false
-}
-```
-
-禁用后：
-
-- 不清空 `out_dir`
-- 不启动子进程
-- VoxCPM 生成的 wav 仍会写到 `out_dir`，但不自动播放
-
-适合以下场景：
-
-- 只想落盘、用另一台设备拉取音频
-- 调试 VoxCPM 输出，不想被扬声器打断
-- 板端没有扬声器
+早期「子进程 + 常驻 aplay」的实现保留在 `wav_player_orig.py`，仅作存档，
+需要单独回放某个目录的 wav 时可以参考或手动运行。
 
 ---
 
@@ -723,7 +739,7 @@ curl -X POST http://localhost:8765/text_input \
 
 **Q1. 唤醒后没有听到「我在」？**
 
-大概率是 `AUDIO_OUTPUT_DEVICE` 不对。参考 [5.4 节](#54-测试麦克风与扬声器) 打印设备列表，找到能出声的索引填回 `config.py`。
+大概率是 `AUDIO_OUTPUT_DEVICE` 不对。参考 [5.5 节](#55-测试麦克风与扬声器) 打印设备列表，找到能出声的索引填回 `config.py`。
 
 **Q2. 唤醒词「灵境灵境」识别不到？**
 
@@ -735,15 +751,15 @@ curl -X POST http://localhost:8765/text_input \
 
 - 检查 `tts_config.json` 里 `server` 是否可达：`curl http://<server>:8808/`
 - 检查 `out_dir` 是否与实际写入目录一致
-- 检查 `wav_player_enabled` 是否为 `true`
-- 查看启动日志里 `[WavPlayer] 已启动 (pid=...)` 是否出现
+- 查看启动日志里 `[VoxCPM-Watch] 监控目录：...` 是否出现（监控线程已启动）
+- 查看播放日志 `[VoxCPM] 播放：...` 是否出现（文件被发现且进入播放）
 - 若配置了 `voice_id` 但服务端未注册，主进程日志会显示错误
 
-**Q4. `wav_player` 没启动？**
+**Q4. VoxCPM 输出线程没工作？**
 
-- 看日志 `[WavPlayer] 已在 tts_config.json 中禁用` → 把 `wav_player_enabled` 改成 `true`
-- 看日志 `[WavPlayer] 脚本不存在` → 确认 `wav_player.py` 与 `main.py` 同目录
-- 看日志 `[WavPlayer] 启动失败` → 手动运行 `python3 wav_player.py /path/to/out_dir` 看具体错误
+- 看日志 `[VoxCPM-Watch] 已清空旧 wav：...` → 监控线程已启动
+- 看日志 `[VoxCPM] 播放失败：...` → 检查音频设备是否被占用（见 Q1 / 14.1）
+- 批量播放依赖 `ffmpeg` 合并：未安装时会自动退化为逐段播放（`which ffmpeg` 检查）
 
 **Q5. 播报期间还会被唤醒吗？**
 
@@ -784,43 +800,35 @@ python main.py --text "今天北京天气怎么样"
 
 **Q11. 如何开机自启？**
 
-创建 systemd service：
-
-```ini
-# /etc/systemd/system/voice-robot.service
-[Unit]
-Description=RK3588 Voice Robot
-After=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/rk3588-voice-robot
-EnvironmentFile=/opt/rk3588-voice-robot/robot.env
-ExecStart=/opt/rk3588-voice-robot/venv/bin/python /opt/rk3588-voice-robot/main.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启用：
+仓库根目录已提供 `voice-robot.service`（`User=root`、带 `--http --port 8765`、`SyslogIdentifier=voice-robot`），直接安装即可：
 
 ```bash
+sudo cp voice-robot.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable voice-robot
-sudo systemctl start voice-robot
+sudo systemctl enable --now voice-robot
 sudo journalctl -u voice-robot -f
 ```
 
-**Q12. wav_player 的 aplay 崩溃了怎么办？**
+或交给一键脚本：`bash scripts/deploy.sh --service`。
 
-`wav_player.py` 里的 `ResidentAplay` 会在 `BrokenPipeError` 时自动重启 aplay 进程。若频繁崩溃，检查：
+改用普通用户运行（非 root）时，按 `voice-robot.service` 内注释四步调整：
 
-- 音频设备是否被其他进程占用
+1. 改文件里的 `User=` / `Group=`
+2. `sudo usermod -aG audio,video <用户名>`
+3. `sudo chown -R <用户名>:<用户名> /opt/rk3588-voice-robot`
+4. 用该用户重建 `venv`（否则 `ExecStart` 找不到解释器）
+
+> 若板上曾部署过旧版 `robot.service`（`/opt/robot`，路径有误），先清理：
+> `sudo systemctl disable --now robot.service && sudo rm -f /etc/systemd/system/robot.service`
+
+**Q12. 播放报设备错误 / 无声？**
+
+当前播放统一走主进程 `AudioPlayer`（sounddevice 输出）。若报 `PortAudioError`
+或设备占用：
+
+- 音频设备是否被其他进程占用（`fuser -v /dev/snd/*`）
 - `aplay -l` 是否能列出设备
-- `config.py` 里是否需要指定 ALSA 设备号
+- 参考 5.5 节确认输出设备索引（当前 `AudioPlayer` 使用系统默认输出）
 
 ---
 
@@ -857,9 +865,10 @@ aplay test.wav
 | 日志关键字 | 含义 | 处理 |
 |-----------|------|------|
 | `模型文件不存在：...` | 模型缺失 | 下载对应模型 |
-| `[WavPlayer] 已启动 (pid=...)` | 子进程正常 | 无需处理 |
-| `[WavPlayer] 已在 tts_config.json 中禁用` | 被显式禁用 | 改 `wav_player_enabled` |
-| `[WavPlayer] 已终止` | 正常退出 | 无需处理 |
+| `[VoxCPM-Watch] 监控目录：...` | 监控线程已启动 | 无需处理 |
+| `[VoxCPM-Watch] 已清空旧 wav：...` | 启动时清理完成 | 无需处理 |
+| `[VoxCPM] 播放：...` / `批量播放 N 段` | 输出 wav 正在播放 | 无需处理 |
+| `[VoxCPM] 播放失败：...` | 播放出错 | 检查音频设备占用（见 14.1） |
 | `[KWS] 唤醒：...` | 唤醒成功 | — |
 | `[ASR] ...` | 识别结果 | — |
 | `[Route] 动作指令：...` | 命中动作 | — |
@@ -900,31 +909,30 @@ voxcpm voice register --id female --audio /path/to/ref.wav
    请检查拼写，或在服务端运行：  voxcpm voice list
 ```
 
-### 14.4 wav_player 侧排查
+### 14.4 VoxCPM 输出播放侧排查
 
-**手动运行看细节：**
+**手动测试监控与播放：**
 
-```bash
-python3 wav_player.py /opt/rk3588-voice-robot/outputs
-```
-
-另开终端生成一个 wav：
+另开终端放一个写完的 wav 到输出目录：
 
 ```bash
 cp /path/to/some.wav /opt/rk3588-voice-robot/outputs/test.wav
 ```
 
-观察是否被播放。若没反应：
+观察主进程日志是否出现 `[VoxCPM] 播放：test.wav`。若没反应：
 
-- 检查 wav 是否写完（`wav_player.py` 有「大小稳定 2 次」的检测）
 - 检查文件名是否以 `.wav` 结尾
-- 检查播放是否被去重（同文件同 mtime 只播一次）
+- 检查 wav 是否写完且合法（监控线程会 `wave.open` 校验；写一半的文件会被忽略）
+- 检查是否是启动前已存在的旧文件（基线扫描会标记为已播放，不会重播）
 
-**aplay 直接测试：**
+**跳过监控线程直接测试音频输出：**
 
 ```bash
 aplay /opt/rk3588-voice-robot/outputs/test.wav
 ```
+
+`aplay` 有声但主进程无声 → 问题在 `AudioPlayer`/设备选择（见 14.1 与 Q1）；
+`aplay` 也没声 → 系统音频问题（见 14.1）。
 
 ### 14.5 查看 systemd 日志
 
@@ -973,7 +981,6 @@ sudo journalctl -u voice-robot --since "10 minutes ago"
 | `api_name` | `/generate` |
 | `backend` | auto |
 | `out_dir` | `./outputs` |
-| `wav_player_enabled` | true |
 | `auto_play` | true |
 | `gapless` | true |
 | `stream_workers` | 4 |
