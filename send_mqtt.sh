@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # MQTT配置
-MQTT_HOST="192.168.200.30"
+#MQTT_HOST="192.168.200.30"
+MQTT_HOST="127.0.0.1"
 MQTT_PORT="1883"
 MQTT_TOPIC="device/command"
 
