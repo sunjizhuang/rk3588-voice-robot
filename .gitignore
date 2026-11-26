@@ -2,7 +2,9 @@
 venv/
 
 # 模型文件
-models/
+#models/
+models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/*.onnx
+models/vits-melo-tts-zh_en/*.onnx
 
 # 输出结果
 outputs/
